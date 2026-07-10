@@ -3,4 +3,4 @@ PyPSA-TR is an open-source model of the Turkish power system built on the PyPSA-
 
 # PyPSA-Turkey
 
-![Turkey Power System](figures/Figure_01_Turkey_50Cluster_Capacity_Map)
+![Turkey Capacity Map](Figures/Figure_01_Turkey_50Cluster_Capacity_Map.png)
