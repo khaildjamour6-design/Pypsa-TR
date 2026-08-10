@@ -1,0 +1,262 @@
+"""
+build_network.py — Stage 6
+
+Assembles a PyPSA Network object for Turkey from the outputs of Stages
+2-5: national demand, the plant fleet, the 7-region grid topology, and
+renewable capacity factor profiles.
+
+Modeling choices (documented so they're easy to revisit):
+
+  - Topology: simplified zonal/transport model, one bus per region,
+    inter-region transmission represented as bidirectional Links (not
+    full AC lines with impedance) — appropriate for a national capacity-
+    -expansion-style study, following the same simplification PyPSA-GB
+    uses for its zonal configuration. A nodal AC power flow model would
+    need line reactances from real TEIAS grid data, which isn't available
+    yet.
+  - Regional demand split: computed from real population/GDP data by
+    Stage 4b (build_regional_demand_share.py).
+  - Dispatchable generators (gas, coal, lignite, oil, geothermal,
+    biomass, nuclear, reservoir hydro) in the EXISTING fleet are modeled
+    as fully flexible up to installed capacity (p_max_pu = 1). Reservoir
+    hydro in particular is more realistically energy-constrained (limited
+    by inflow/storage) — a known simplification, candidate for later
+    refinement (e.g. modeling it as a StorageUnit).
+  - Run-of-river hydro uses a flat capacity factor as a placeholder,
+    pending real hydrological inflow data.
+  - Capacity expansion (Stage 6b): solar, wind, and gas can build NEW
+    capacity beyond the existing fleet, subject to a CO2 emissions cap.
+    Capital costs and CO2 factors below are literature-typical values,
+    NOT Turkey-specific bottom-up costs — same "placeholder pending
+    refinement" status as ROR_FLAT_CF. Wind/solar potential caps are
+    Turkey-specific, sourced from SHURA's NZ2053 report (Table 4). The
+    CO2 limit (140 MtCO2) is drawn from SHURA's NZ2053 pathway, which is
+    back-loaded (slow reduction to 2030, rapid coal phase-out after).
+
+Output: resources/networks/turkey_base.nc
+"""
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import pypsa
+
+ROR_FLAT_CF = 0.45  # placeholder pending real hydrological data
+FULLY_DISPATCHABLE_CARRIERS = {
+    "gas", "coal", "lignite", "oil", "geothermal", "biomass", "nuclear", "hydro",
+}
+
+# --- Capacity expansion assumptions (Stage 6b) ---------------------------
+EXTENDABLE_CARRIERS = {"solar", "wind", "gas"}
+
+TECH_DATA = {
+    "solar": {"capital_cost": 55_000, "co2_t_per_mwh": 0.0, "p_nom_max": None},
+    "wind":  {"capital_cost": 105_000, "co2_t_per_mwh": 0.0, "p_nom_max": 140_000},  # SHURA: 120 GW onshore + 20 GW offshore
+    "gas":   {"capital_cost": 75_000, "co2_t_per_mwh": 0.40, "p_nom_max": None},
+}
+
+# CO2 factors for the fixed (non-extendable) fleet.
+CO2_FACTORS_FIXED = {
+    "coal": 0.90, "lignite": 1.10, "oil": 0.65,
+    "nuclear": 0.0, "hydro": 0.0, "geothermal": 0.0, "biomass": 0.0, "ror": 0.0,
+}
+
+CO2_LIMIT_TONNES = 140e6  # SHURA NZ2053 pathway: ~140 MtCO2 power-sector interim target
+
+
+def build_network(
+    demand_path: str,
+    powerplants_path: str,
+    buses_path: str,
+    lines_path: str,
+    renewables_path: str,
+    regional_demand_share_path: str,
+    output_path: str,
+    resolution_hours: int = 1,
+) -> pypsa.Network:
+    """
+    Build a PyPSA Network object for Turkey from the outputs of Stages 2-5.
+
+    Parameters
+    ----------
+    demand_path : str
+        Path to the CSV file containing national demand profiles.
+    powerplants_path : str
+        Path to the CSV file containing power plant data.
+    buses_path : str
+        Path to the CSV file containing bus data.
+    lines_path : str
+        Path to the CSV file containing line data.
+    renewables_path : str
+        Path to the CSV file containing renewable capacity factor profiles.
+    regional_demand_share_path : str
+        Path to the CSV file containing regional demand share data.
+    output_path : str
+        Path where the resulting PyPSA Network will be saved in NetCDF format.
+    resolution_hours : int, optional
+        The time resolution in hours for downsampling the snapshots. Default is 1 hour.
+
+    Returns
+    -------
+    pypsa.Network
+        The constructed PyPSA Network object.
+    """
+    demand = pd.read_csv(demand_path, parse_dates=["snapshot"])
+    plants = pd.read_csv(powerplants_path)
+    buses = pd.read_csv(buses_path)
+    lines = pd.read_csv(lines_path)
+    renewables = pd.read_csv(renewables_path, parse_dates=["snapshot"])
+    regional_demand_share = pd.read_csv(regional_demand_share_path).set_index("region")["share"]
+
+    if resolution_hours > 1:
+        # Downsample to every Nth hour and weight snapshots accordingly,
+        # so annual totals (generation, cost) stay correct while the LP
+        # stays solvable on limited hardware. Full 8760-hour resolution
+        # is the default for production runs with adequate compute; this
+        # is a standard PyPSA time-aggregation practice, not a change to
+        # the model itself.
+        keep_snapshots = demand["snapshot"].iloc[::resolution_hours].values
+        demand = demand[demand["snapshot"].isin(keep_snapshots)].reset_index(drop=True)
+        renewables = renewables[renewables["snapshot"].isin(keep_snapshots)].reset_index(drop=True)
+
+    missing_share = set(buses["region"]) - set(regional_demand_share.index)
+    if missing_share:
+        raise ValueError(f"no demand share defined for regions: {missing_share}")
+    if abs(regional_demand_share.sum() - 1.0) > 1e-6:
+        raise ValueError("regional_demand_share does not sum to 1.0")
+
+    n = pypsa.Network()
+    n.set_snapshots(demand["snapshot"].values)
+    n.snapshot_weightings.loc[:, :] = resolution_hours
+
+    for carrier in sorted(set(plants["carrier"]) | {"AC"} | EXTENDABLE_CARRIERS):
+        if carrier not in n.carriers.index:
+            co2 = TECH_DATA.get(carrier, {}).get("co2_t_per_mwh", CO2_FACTORS_FIXED.get(carrier, 0.0))
+            n.add("Carrier", carrier, co2_emissions=co2)
+
+    n.add(
+        "GlobalConstraint",
+        "co2_limit",
+        type="co2_limit",
+        carrier_attribute="co2_emissions",
+        sense="<=",
+        constant=CO2_LIMIT_TONNES,
+    )
+
+    for row in buses.itertuples():
+        n.add("Bus", row.region, x=row.x, y=row.y, carrier="AC")
+
+    for row in lines.itertuples():
+        n.add(
+            "Link",
+            row.name,
+            bus0=row.bus0,
+            bus1=row.bus1,
+            p_nom=row.s_nom_mw,
+            p_min_pu=-1,  # bidirectional transport-model link
+            efficiency=1.0,
+            marginal_cost=0.0,
+        )
+
+    national_load = demand.set_index("snapshot")["load_mw"]
+    for region, share in regional_demand_share.items():
+        n.add("Load", f"load_{region}", bus=region, p_set=(national_load * share).values)
+
+    renew_pivot_solar = renewables.pivot(index="snapshot", columns="region", values="solar_cf")
+    renew_pivot_wind = renewables.pivot(index="snapshot", columns="region", values="wind_cf")
+
+    for row in plants.itertuples():
+        carrier = row.carrier
+        if carrier == "solar":
+            p_max_pu = renew_pivot_solar[row.region].values
+        elif carrier == "wind":
+            p_max_pu = renew_pivot_wind[row.region].values
+        elif carrier == "ror":
+            p_max_pu = ROR_FLAT_CF
+        elif carrier in FULLY_DISPATCHABLE_CARRIERS:
+            p_max_pu = 1.0
+        else:
+            raise ValueError(f"unhandled carrier '{carrier}' for plant {row.name}")
+
+        n.add(
+            "Generator",
+            row.name,
+            bus=row.region,
+            carrier=carrier,
+            p_nom=row.p_nom_mw,
+            marginal_cost=row.marginal_cost_eur_per_mwh,
+            p_max_pu=p_max_pu,
+        )
+
+    # New-build extendable capacity (Stage 6b): one candidate generator per
+    # region per extendable carrier, p_nom=0 initially, able to expand up
+    # to a resource-potential cap subject to the CO2 constraint above.
+    for region in buses["region"]:
+        for carrier in EXTENDABLE_CARRIERS:
+            tech = TECH_DATA[carrier]
+            if carrier == "solar":
+                p_max_pu = renew_pivot_solar[region].values
+            elif carrier == "wind":
+                p_max_pu = renew_pivot_wind[region].values
+            else:
+                p_max_pu = 1.0
+
+            n.add(
+                "Generator",
+                f"new_{carrier}_{region}",
+                bus=region,
+                carrier=carrier,
+                p_nom=0,
+                p_nom_extendable=True,
+                p_nom_max=tech["p_nom_max"] if tech["p_nom_max"] is not None else float("inf"),
+                capital_cost=tech["capital_cost"],
+                marginal_cost=30.0 if carrier == "gas" else 0.0,
+                p_max_pu=p_max_pu,
+            )
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    n.export_to_netcdf(output_path)
+
+    print(
+        f"[build_network] assembled network: {len(n.buses)} buses, "
+        f"{len(n.links)} links, {len(n.generators)} generators, "
+        f"{len(n.loads)} loads, {len(n.snapshots)} snapshots\n"
+        f"[build_network] total generator capacity = "
+        f"{n.generators.p_nom.sum()/1e3:.1f} GW\n"
+        f"[build_network] CO2 limit set to {CO2_LIMIT_TONNES/1e6:.0f} MtCO2\n"
+        f"[build_network] wrote {output_path}"
+    )
+    return n
+
+
+if __name__ == "__main__":
+    try:
+        demand_path = snakemake.input.demand  # noqa: F821
+        powerplants_path = snakemake.input.powerplants  # noqa: F821
+        buses_path = snakemake.input.buses  # noqa: F821
+        lines_path = snakemake.input.lines  # noqa: F821
+        renewables_path = snakemake.input.renewables  # noqa: F821
+        regional_demand_share_path = snakemake.input.regional_demand_share  # noqa: F821
+        output_path = snakemake.output[0]  # noqa: F821
+        resolution_hours = snakemake.config.get("scenario", {}).get("snapshot_resolution_hours", 1)  # noqa: F821
+    except NameError:
+        args = sys.argv[1:]
+        defaults = [
+            "resources/demand_profiles.csv",
+            "resources/powerplants.csv",
+            "resources/buses.csv",
+            "resources/lines.csv",
+            "resources/renewable_profiles.csv",
+            "resources/regional_demand_share.csv",
+            "resources/networks/turkey_base.nc",
+        ]
+        args = args + defaults[len(args):]
+        (demand_path, powerplants_path, buses_path, lines_path, renewables_path,
+         regional_demand_share_path, output_path) = args
+        resolution_hours = 1
+
+    build_network(
+        demand_path, powerplants_path, buses_path, lines_path, renewables_path,
+        regional_demand_share_path, output_path, resolution_hours=resolution_hours,
+    )
